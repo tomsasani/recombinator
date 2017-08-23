@@ -24,17 +24,18 @@ def tranche99(filt, cutoff=99.6):
 
 
 def variant_prefilter(v, min_variant_qual):
-
-    if len(v.REF) > 4: return False
+    # Current hard filter on indel mutations.
+    if len(v.REF) > 1: return False
     if len(v.ALT) > 2 or "*" in v.ALT: return False
-    if len(v.ALT[0]) > 6: return False
+    # Current hard filter on indel mutations.
+    if len(v.ALT[0]) > 1: return False
     if v.FILTER is not None and not tranche99(v.FILTER) : return False
 
     if v.QUAL < min_variant_qual: return False
     return True
 
 def get_denovo(v, samples, f1s, f2s, max_alts_in_parents=1,
-        min_depth=5,
+        min_depth=10,
         max_mean_depth=400,
         min_allele_balance_p=0.05,
         min_qual=1,
@@ -73,11 +74,11 @@ def get_denovo(v, samples, f1s, f2s, max_alts_in_parents=1,
         for f1 in f1s:
             f1_idx = samples[f1.sample_id]
             if gts[f1_idx] != HET: continue
-            # check that parents are hom-ref
+            # Added try/except since sample '8477' apparently doesn't exist in our ceph pedigree
             if f1.mom.sample_id == '8477' or f1.dad.sample_id == '8477':
                 continue
             mi, di = samples[f1.mom.sample_id], samples[f1.dad.sample_id]
-            # Added try/except since sample '8477' apparently doesn't exist in a pedigree
+            # check that parents are hom-ref or unknown
             for pi in (mi, di):
                 if not (gts[pi] == 0 or gts[pi] == 2): continue
             # List of peddy.Samples() that represent children of the f1 we're looping over.
@@ -86,7 +87,6 @@ def get_denovo(v, samples, f1s, f2s, max_alts_in_parents=1,
                 f2_idxs = [samples[k.sample_id] for k in f2s]
 
             if depths is None:
-                #depths = v.format('AD', int)
                 ref_depths = v.gt_ref_depths
                 ref_depths[ref_depths < 0] = 0
             if alt_depths is None:
@@ -99,20 +99,20 @@ def get_denovo(v, samples, f1s, f2s, max_alts_in_parents=1,
             f1_ref = ref_depths[f1_idx]
 
             # depth filtering.
-            if f1_alt + f1_ref < min_depth + 1: continue
+            if f1_alt + f1_ref < min_depth: continue
             if f1_alt < min_depth / 2: continue
-            if ref_depths[di] + alt_depths[di] < min_depth - 1: continue
-            if ref_depths[mi] + alt_depths[mi] < min_depth - 1: continue
+            if ref_depths[di] + alt_depths[di] < min_depth: continue
+            if ref_depths[mi] + alt_depths[mi] < min_depth: continue
 
-            if np.mean(alt_depths + ref_depths) > max_mean_depth:
-                continue
+            # Not sure why this filter is necessary.
+            #if np.mean(alt_depths + ref_depths) > max_mean_depth:
+            #    continue
 
             # if there are too many alts outside this kid. skip
             # however, ignore the potential alts (i.e., transmitted DNM) in the f1's
             # children
             alt_sum = sum([alt_depths[i] for i in range(len(alt_depths)) if i not in f2_idxs]) - f1_alt
             ref_sum = sum([ref_depths[i] for i in range(len(ref_depths)) if i not in f2_idxs]) - f1_ref
-
             # this check is less stringent than the p-value checks below but
             # avoids some compute.
             if _use_cohort_filters and alt_sum > len(samples) * 0.01:
@@ -125,8 +125,9 @@ def get_denovo(v, samples, f1s, f2s, max_alts_in_parents=1,
                 if f1_alt < 6: continue
 
             # via Tom Sasani.
-            palt = ss.binom_test([alt_sum, ref_sum], 
-                    p=0.0002,
+            palt = ss.binom_test([alt_sum, alt_sum + ref_sum], 
+                    p=0.00075, # expected probability of observing an alt
+                               # allele in the population
                     alternative="greater")
             if _use_cohort_filters and palt < min_allele_balance_p: continue
 
@@ -144,13 +145,12 @@ def get_denovo(v, samples, f1s, f2s, max_alts_in_parents=1,
                 # fewer than 1 alt per 500-hundred samples.
                 if _use_cohort_filters and alt_sum > 0.002 * len(samples): continue
                 # no alts in either parent.
-                if alt_depths[[mi, di]].sum() > 0: continue
-
             # at this point, the variant is a solid putative DNM. now need
             # to validate that it's in at least one of the f2s. all of the
             # previous filters were on a population basis, so for now we'll only
             # check if one of the kids is a HET
             f2_count = 0
+            f2_with_v = []
             for f2 in f2s:
                 mi, di = samples[f2.mom.sample_id], samples[f2.dad.sample_id]
                 # Make sure that the F1's partner doesn't also have the same DNM
@@ -158,8 +158,10 @@ def get_denovo(v, samples, f1s, f2s, max_alts_in_parents=1,
                 f2_idx = samples[f2.sample_id]
                 if gts[f2_idx] == HET:
                     f2_count += 1
+                    f2_with_v.append(f2)
+
             if f2_count > 0:
-                ret.extend(variant_info(v, f1, samples, pab, palt, alt_i=k))
+                ret.extend(variant_info(v, f1, f2_with_v, samples, pab, palt, alt_i=k))
 
     if exclude is not None and 0 != len(exclude[v.CHROM].search(v.start, v.end)):
         return None
@@ -169,26 +171,34 @@ def get_denovo(v, samples, f1s, f2s, max_alts_in_parents=1,
     # multiple alts.
     if len(ret) == 1: return ret[0]
 
-def variant_info(v, kid, samples, pab=None, palt=None, alt_i=None):
+def variant_info(v, f1, f2_with_v, samples, pab=None, palt=None, alt_i=None):
 
-    quals = v.gt_quals
-    ki, mi, di = samples[kid.sample_id], samples[kid.mom.sample_id], samples[kid.dad.sample_id]
-    depths = v.format('AD', int)
-    ref_depths = depths[:, 0]
-    all_alts = depths[:, 1:]
-    for k in range(all_alts.shape[1]):
-        if alt_i is not None and alt_i != (k + 1): continue
-        alt_depths = all_alts[:, k]
+    f1_idx, mi, di = samples[f1.sample_id], samples[f1.mom.sample_id], samples[f1.dad.sample_id]
 
-        #ref_depths, alt_depths, quals = v.gt_ref_depths, v.gt_alt_depths, v.gt_quals
-        kid_ref, kid_alt = ref_depths[ki], alt_depths[ki]
-        alt_sum = alt_depths.sum() - kid_alt
+    f2_with_v_idx = [samples[f2.sample_id] for f2 in f2_with_v]
+    #depths = v.format('AD', int)
+    #ref_depths = depths[:, 0]
+    #all_alts = depths[:, 1:]
+
+    ref_depths, alt_depths, quals = v.gt_ref_depths, v.gt_alt_depths, v.gt_quals
+
+    #for k in range(all_alts.shape[1]):
+    
+    for k in range(len(v.ALT)):
+
+        # Below line prevents DNM calling, need to figure out why.
+        #if alt_i is not None and alt_i != (k + 1): continue
+        #alt_depths = all_alts[:, k]
+
+        f1_ref, f1_alt = ref_depths[f1_idx], alt_depths[f1_idx]
+        alt_sum = sum([alt_depths[i] for i in range(len(alt_depths)) if i not in f2_with_v_idx]) - f1_alt
+        ref_sum = sum([ref_depths[i] for i in range(len(ref_depths)) if i not in f2_with_v_idx]) - f1_ref
         if pab is None:
-            pab = ss.binom_test([kid_ref, kid_alt])
+            pab = ss.binom_test([f1_ref, f1_alt])
         if palt is None:
-            palt = ss.binom_test([alt_sum, ref_depths.sum() - kid_ref], p=0.0002,
+            palt = ss.binom_test([alt_sum, ref_sum], p=0.00075,
                     alternative="greater")
-
+    
         yield OrderedDict((
             ("chrom", v.CHROM),
             ("start", v.start),
@@ -221,11 +231,12 @@ def variant_info(v, kid, samples, pab=None, palt=None, alt_i=None):
             ("qual_mean", "%.1f" % np.mean(quals)),
             ("call_rate", "%.3f" % v.call_rate),
             ("cohort_alt_depth", alt_sum),
+            ("f2_with_variant", ','.join([str(x.sample_id) for x in f2_with_v])),
             ))
 
 
 def denovo(v, samples, f1s, f2s,  max_alts_in_parents=1,
-        min_depth=5,
+        min_depth=10,
         max_mean_depth=400,
         min_allele_balance_p=0.05,
         min_depth_percentile=3,
@@ -256,6 +267,7 @@ def run(args):
     ped = Ped(args.ped)
     psamples = set([x.sample_id for x in ped.samples()])
     samples = [x for x in vcf.samples if x in psamples]
+    
     if args.exclude:
         from .recombinator import read_exclude
         exclude = read_exclude(args.exclude, args.chrom)
