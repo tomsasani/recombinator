@@ -35,8 +35,27 @@ def variant_prefilter(v, min_variant_qual):
     if v.QUAL < min_variant_qual: return False
     return True
 
-def eval_alignments(v, f1,
-        prefix="/scratch/ucgd/lustre/ugpuser/Repository/AnalysisData/2016/A414/16-08-06_WashU-Yandell-CEPH/UGP/Data/PolishedBams/"):
+def enriched_for_splitters(v, f1, split_limit=5,
+    prefix="/scratch/ucgd/lustre/ugpuser/Repository/AnalysisData/2016/A414/16-08-06_WashU-Yandell-CEPH/UGP/Data/PolishedBams/"):
+
+    split_count = 0
+
+    bam = pysam.AlignmentFile(prefix + f1.sample_id + ".bam", "rb")
+    reads = []
+    for read in bam.fetch(v.CHROM, int(v.POS) - 10, int(v.POS) + 10):
+        try:
+            if read.query_name not in reads and len(read.get_tag("SA")) > 0:
+                reads.append(read.query_name)
+                split_count += 1
+                continue
+        except KeyError:
+            continue
+
+    if split_count > split_limit:
+        return True
+
+def eval_alignments(v, f1, 
+    prefix="/scratch/ucgd/lustre/ugpuser/Repository/AnalysisData/2016/A414/16-08-06_WashU-Yandell-CEPH/UGP/Data/PolishedBams/"):
 
     m_bam = pysam.AlignmentFile(prefix + f1.mom.sample_id + ".bam", "rb")
     m_ab = alignment_ab(v, m_bam)
@@ -45,13 +64,13 @@ def eval_alignments(v, f1,
 
     return (m_ab, d_ab)
 
-def alignment_ab(v, bam, buff=5):
+def alignment_ab(v, bam):
     ref_sum, alt_sum = 0, 0
     ref = v.REF
     if isinstance(v.ALT, list):
         alt = v.ALT[0]
     else: alt = v.ALT
-    for pileupcolumn in bam.pileup(v.CHROM, int(v.POS) - buff, int(v.POS) + buff):
+    for pileupcolumn in bam.pileup(v.CHROM, int(v.POS) - 1, int(v.POS) + 1):
         if pileupcolumn.pos != int(v.POS) - 1:
             continue
         for pileupread in pileupcolumn.pileups:
@@ -65,6 +84,18 @@ def alignment_ab(v, bam, buff=5):
     ab = alt_sum / float(ref_sum + alt_sum) 
     return ab
 
+def enriched_for_bad_mapping(v, f1, mapq0_lim=5,
+    prefix="/scratch/ucgd/lustre/ugpuser/Repository/AnalysisData/2016/A414/16-08-06_WashU-Yandell-CEPH/UGP/Data/PolishedBams/"):
+    bam = pysam.AlignmentFile(prefix + f1.sample_id + ".bam", "rb")
+
+    mapq0 = 0
+    for read in bam.fetch(v.CHROM, int(v.POS) - 10, int(v.POS) + 10):
+        if read.mapping_quality == 0:
+            mapq0 += 1
+    if mapq0 > mapq0_lim:
+        return True
+
+
 def get_denovo(v, samples, f1s, f2s, max_alts_in_parents=1,
         min_depth=5,
         max_mean_depth=400,
@@ -73,6 +104,7 @@ def get_denovo(v, samples, f1s, f2s, max_alts_in_parents=1,
         min_qual=1,
         min_p_ab=0.1,
         exclude=None,
+        one_sample=None,
         _use_cohort_filters=True,
         HET=1):
     """
@@ -90,7 +122,25 @@ def get_denovo(v, samples, f1s, f2s, max_alts_in_parents=1,
     decide if a variant is denovo. don't use things like AF in the cohort.
     """
 
-    if _use_cohort_filters and v.num_het > 2: return None
+    # Check to see if we need to be extra stringent with the DNM if it's
+    # in a homopolymer/low complexity region, etc.
+    stringent = False
+    interval_type = None
+    if exclude is not None:
+        # If this variant is in an exclude region...
+        if len(exclude[v.CHROM].search(v.start, v.end)) > 0:
+            interval_type = exclude[v.CHROM].search(v.start, v.end)[0].data
+            # If the exclude region is a SINE/LINE, check its "age."
+            # If it's young, make filters stringent. If it's old, treat it like
+            # any other non-exclude region of the genome.
+            if interval_type[:4] in ['SINE', 'LINE']:
+                pass
+   #             sim = float(interval_type.split('_')[1])
+   #             similarity = sim
+   #             if sim > 80.: stringent = True
+            else: return None
+        else: pass
+    
     if _use_cohort_filters and v.num_hom_alt > 1: return None
 
     ret = []
@@ -111,21 +161,21 @@ def get_denovo(v, samples, f1s, f2s, max_alts_in_parents=1,
             if f1.mom.sample_id == '8477' or f1.dad.sample_id == '8477':
                 continue
             mi, di = samples[f1.mom.sample_id], samples[f1.dad.sample_id]
-            # check that parents are hom-ref or unknown
+            # check that parents are hom-ref
             if not (gts[di] == 0 and gts[mi] == 0):
                 continue
+
             # NOTE: changed below two lines, because the "continue"
             # statement would only continue the "for pi in ()" loop,
             # and wouldn't go back to the parent loop.
             #for pi in (mi, di):
             #    if not gts[pi] == 0: continue
             # List of peddy.Samples() that represent children of the f1 we're looping over.
-            if f2s is not None:
-                f2s = [k for k in f2s if f1.sample_id in [k.mom.sample_id, k.dad.sample_id]]
-                f2_idxs = [samples[k.sample_id] for k in f2s]
+            f2s = [k for k in f2s if f1.sample_id in [k.mom.sample_id, k.dad.sample_id]]
+            f2_idxs = [samples[k.sample_id] for k in f2s]
 
+            # Total number of ALT alleles in F2s.
             ac_dict = {3:2, 2:0, 1:1, 0:0}
-
             ac_in_f2s = sum([ac_dict[gts[i]] for i in f2_idxs])
 
             if depths is None:
@@ -147,10 +197,8 @@ def get_denovo(v, samples, f1s, f2s, max_alts_in_parents=1,
             if ref_depths[di] + alt_depths[di] < min_depth: continue
             if ref_depths[mi] + alt_depths[mi] < min_depth: continue
 
-            # Not sure why this filter is necessary.
-            # NOTE: got rid of this
-            #if np.mean(alt_depths + ref_depths) > max_mean_depth:
-            #    continue
+            if np.mean(alt_depths + ref_depths) > max_mean_depth:
+                continue
 
             # if there are too many alts outside this kid, skip. however,
             # ignore the potential alts (i.e., transmitted DNM) in the f1's children
@@ -170,35 +218,47 @@ def get_denovo(v, samples, f1s, f2s, max_alts_in_parents=1,
 
             # via Tom Sasani.
             # NOTE: changed this to do the test on number of alt ALLELEs, not depth
-            palt = ss.binom_test([int(v.INFO.get('AC')) - 1 - ac_in_f2s, int(v.INFO.get('AN')) - ((len(f2s)) * 2) - 2], 
+            # calculate enrichment of ALT alleles in the cohort. [x, y] where x is 
+            # the number of ALT alleles in the cohort (outside the F1 we're currently looking at and
+            # the F1's kids), and y is the total number of alleles in the cohort, outside 
+            # of the F2s and the F1 we're looking at
+
+            alt_in_cohort = int(v.INFO.get('AC')) - 1 - ac_in_f2s
+            total_alleles_in_cohort = int(v.INFO.get('AN')) - (len(f2s) * 2) - 2
+
+            palt = ss.binom_test([alt_sum, ref_sum],  
                     p=0.002, # expected probability of observing an alt
-                               # allele in the population
+                               # read in the population
                     alternative="greater") # one-sided
             if _use_cohort_filters and palt < min_cohort_enrich_p: continue
 
-            # Changed this to become two separate checks for REF and ALT depth.
             pab = ss.binom_test([f1_ref, f1_alt], p=0.5, alternative='two-sided') 
             if pab < min_allele_balance_p: continue
 
-            # Confirm that alignments show lack of alt alleles in parents:
-            m_ab, d_ab = eval_alignments(v, f1)
-
-            if m_ab > min_p_ab or d_ab > min_p_ab:
-                continue
-
             # TODO: check why some quals are 0 and if filtering on this improve
             # accuracy.
-            #quals = v.gt_quals
-            #quals[quals < 0] == 0
-            #if quals[f1_idx] < 1 or quals[mi] < 1 or quals[di] < 1: continue
+            quals = v.gt_quals
+            quals[quals < 0] == 0
+            if quals[f1_idx] < 1 or quals[mi] < 1 or quals[di] < 1: continue
 
             # stricter settings with FILTER
-            # Seems as though FILTER is always None...
+            # Note: seems as though FILTER is always None...
             if v.FILTER is not None:
                 # fewer than 1 alt per 500-hundred samples.
                 #if _use_cohort_filters and alt_sum > 0.002 * len(samples): continue
                 if _use_cohort_filters and int(v.INFO.get('AC')) > 0.002 * len(samples): continue
-                # no alts in either parent.
+           
+            # Confirm that parents don't have excess of ALT reads in the BAM.
+            m_ab, d_ab = eval_alignments(v, f1)
+            if (m_ab > min_p_ab or d_ab > min_p_ab):
+                continue
+            # Check for enrichment of split alignments surrounding the putative DNM.
+            # If True, indicative of a problematic region for alignments.
+            if enriched_for_splitters(v, f1, split_limit=5):
+                continue
+            # Check for enrichment of 0-quality alignments, similar to check above.
+            if enriched_for_bad_mapping(v, f1, mapq0_lim=5):
+                continue
             
             # at this point, the variant is a solid putative DNM. now need
             # to validate that it's in at least one of the f2s. all of the
@@ -219,18 +279,16 @@ def get_denovo(v, samples, f1s, f2s, max_alts_in_parents=1,
                 if gts[f2_idx] == 1:
                     f2_count += 1
                     f2_with_v.append(f2)
-            ret.extend(variant_info(v, f1, f2_with_v, samples, pab=pab, palt=palt, alt_i=k))
 
+            ret.extend(variant_info(v, f1, f2_with_v, samples, interval_type=interval_type, pab=pab, palt=palt, alt_i=k))
 
-    if exclude is not None and 0 != len(exclude[v.CHROM].search(v.start, v.end)):
-        return None
 
     # shouldn't have multiple samples with same de novo.
     # TODO: make this a parameter. And/or handle sites where we get denovos from
     # multiple alts.
     if len(ret) == 1: return ret[0]
 
-def variant_info(v, f1, f2_with_v, samples, pab=None, palt=None, alt_i=None):
+def variant_info(v, f1, f2_with_v, samples, interval_type=None, pab=None, palt=None, alt_i=None):
 
     f1_idx, mi, di = samples[f1.sample_id], samples[f1.mom.sample_id], samples[f1.dad.sample_id]
 
@@ -239,7 +297,13 @@ def variant_info(v, f1, f2_with_v, samples, pab=None, palt=None, alt_i=None):
     #ref_depths = depths[:, 0]
     #all_alts = depths[:, 1:]
 
+
     ref_depths, alt_depths, quals = v.gt_ref_depths, v.gt_alt_depths, v.gt_quals
+
+    f1_ref, f1_alt = ref_depths[f1_idx], alt_depths[f1_idx]
+
+    alt_sum = sum([alt_depths[i] for i in range(len(alt_depths)) if i not in f2_with_v_idx]) - f1_alt
+    ref_sum = sum([ref_depths[i] for i in range(len(ref_depths)) if i not in f2_with_v_idx]) - f1_ref
 
     #for k in range(all_alts.shape[1]):
     
@@ -250,13 +314,6 @@ def variant_info(v, f1, f2_with_v, samples, pab=None, palt=None, alt_i=None):
         #alt_depths = all_alts[:, k]
 
         f1_ref, f1_alt = ref_depths[f1_idx], alt_depths[f1_idx]
-        alt_sum = sum([alt_depths[i] for i in range(len(alt_depths)) if i not in f2_with_v_idx]) - f1_alt
-        ref_sum = sum([ref_depths[i] for i in range(len(ref_depths)) if i not in f2_with_v_idx]) - f1_ref
-        if pab is None:
-            pab = ss.binom_test([f1_ref, f1_alt])
-        if palt is None:
-            palt = ss.binom_test([alt_sum, ref_sum], p=0.002,
-                    alternative="greater")
     
         yield OrderedDict((
             ("chrom", v.CHROM),
@@ -291,18 +348,20 @@ def variant_info(v, f1, f2_with_v, samples, pab=None, palt=None, alt_i=None):
             ("qual_mean", "%.1f" % np.mean(quals)),
             ("call_rate", "%.3f" % v.call_rate),
             ("cohort_alt_depth", alt_sum),
+            ("interval_type", interval_type),
             ("f2_with_variant", ','.join([str(x.sample_id) for x in f2_with_v])),
             ))
 
 
-def denovo(v, samples, f1s, f2s,  max_alts_in_parents=5,
+def denovo(v, samples, f1s, f2s, max_alts_in_parents=5,
         min_depth=10,
         max_mean_depth=400,
-        min_allele_balance_p=0.01, #0.05
+        min_allele_balance_p=0.05,
         min_cohort_enrich_p=0.01,
         min_depth_percentile=3,
         min_qual=1,
         _use_cohort_filters=True,
+        one_sample=None,
         exclude=None,
         HET=1):
     if not variant_prefilter(v, 10): return None
@@ -311,6 +370,7 @@ def denovo(v, samples, f1s, f2s,  max_alts_in_parents=5,
             max_mean_depth=max_mean_depth,
             min_allele_balance_p=min_allele_balance_p,
             min_qual=min_qual,
+            one_sample=one_sample,
             exclude=exclude,
             _use_cohort_filters=_use_cohort_filters,
             HET=HET)
@@ -335,6 +395,8 @@ def run(args):
     else:
         exclude = None
 
+    one_sample = args.sample
+
     vcf = VCF(args.vcf, gts012=True, samples=samples)
     wtr = Writer("-", vcf)
 
@@ -342,7 +404,7 @@ def run(args):
     kids = [k for k in ped.samples() if k.mom is not None and k.dad is not None]
 
     p0 = [k for k in ped.samples() if k.mom is None and k.dad is None]
-    f1s = [k for k in kids if k.mom.mom is None and k.dad.dad is None]
+    f1s = [k for k in kids if k.mom.mom is None and k.dad.dad is None and k.mom.dad is None and k.dad.mom is None]
     f2s = [k for k in kids if k not in f1s]
 
     _use_cohort_filters = False if os.environ.get("DN_NO_COHORT") else True
@@ -351,9 +413,8 @@ def run(args):
     for i, v in enumerate(vcf(args.chrom) if args.chrom else vcf, start=1):
         if i % 100000 == 0:
             print(" called %d de-novos out of %d variants" % (n_dn, i), file=sys.stderr)
-
-        d = denovo(v, samples_lookup, f1s, f2s, 
-                exclude=exclude, _use_cohort_filters=_use_cohort_filters)
+        d = denovo(v, samples_lookup, f1s, f2s,
+                exclude=exclude, one_sample=one_sample, _use_cohort_filters=_use_cohort_filters)
         if d is not None:
             write_denovo(d, sys.stdout)
             n_dn += 1
@@ -368,6 +429,7 @@ def main(argv):
     p.add_argument("--chrom", help="extract only this chromosome", default=None)
     p.add_argument("--exclude", help="regions to exclude (e.g. LCRs)")
     p.add_argument("--min-mean-depth", default=10, type=int)
+    p.add_argument("-sample")
     p.add_argument("ped")
     p.add_argument("vcf")
 
