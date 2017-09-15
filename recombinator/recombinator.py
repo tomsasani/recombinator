@@ -70,7 +70,11 @@ def read_exclude(path, chrom=None):
         added += 1
         # NOTE: made the 'other' value equal to whatever annotation I put as the
         # fourth field in the exclude BED file
-        tree[toks[0]].add(int(toks[1]), int(toks[2]), other=toks[3])
+        try: 
+            tree[toks[0]].add(int(toks[1]), int(toks[2]), other=toks[3])
+        except:
+            tree[toks[0]].add(int(toks[1]), int(toks[2]))
+
     if added == 0:
         sys.stderr.write("didnt add any intervals to exclude for chrom:%s\n" % chrom)
     return tree
