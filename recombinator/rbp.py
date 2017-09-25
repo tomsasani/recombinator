@@ -17,7 +17,7 @@ def main(argv):
     args = p.parse_args(argv)
     run(args)
 
-def phased(v, d, kid_id, ev_min=4, prefix="/scratch/ucgd/lustre/ugpuser/Repository/AnalysisData/2016/A414/16-08-06_WashU-Yandell-CEPH/UGP/Data/PolishedBams/"):
+def phased(v, d, kid_id, ev_min=3, prefix="/scratch/ucgd/lustre/ugpuser/Repository/AnalysisData/2016/A414/16-08-06_WashU-Yandell-CEPH/UGP/Data/PolishedBams/"):
 
     evidence = 0
 
@@ -35,21 +35,22 @@ def phased(v, d, kid_id, ev_min=4, prefix="/scratch/ucgd/lustre/ugpuser/Reposito
         # check that the read has support for both the putative HET
         # AND the known DNM.
         for pileupread in pileupcolumn.pileups:
-            if not pileupread.is_del and not pileupread.is_refskip:
-                query = pileupread.alignment.query_sequence
-                # If variant to phase is before the DNM.
-                if dist < 0:
-                    try:
-                        if query[pileupread.query_position].upper() == v.ALT[0].upper() and query[pileupread.query_position + abs(dist)] == d['alt']:
-                            evidence += 1
-                    except IndexError:
-                        continue
-                else:
-                    try:
-                        if query[pileupread.query_position].upper() == v.ALT[0].upper() and query[pileupread.query_position - abs(dist)] == d['alt']:
-                            evidence += 1
-                    except IndexError:
-                        continue
+            if pileupread.is_del or pileupread.is_refskip:
+                continue
+            query = pileupread.alignment.query_sequence
+            # If variant to phase is before the DNM.
+            if dist < 0:
+                try:
+                    if query[pileupread.query_position].upper() == v.ALT[0].upper() and query[pileupread.query_position + abs(dist)] == d['alt']:
+                        evidence += 1
+                except IndexError:
+                    continue
+            else:
+                try:
+                    if query[pileupread.query_position].upper() == v.ALT[0].upper() and query[pileupread.query_position - abs(dist)] == d['alt']:
+                        evidence += 1
+                except IndexError:
+                    continue
 
     if evidence >= ev_min:
         return True
@@ -64,6 +65,8 @@ def filter_sites(v, i, min_depth=10, min_ab_p=0.05):
     return True
 
 def run(args):
+
+    HET, HOM_REF = 1, 0
 
     vcf = VCF(args.vcf, gts012=True)
     sample_lookup = {s: i for i, s in enumerate(vcf.samples)}
@@ -80,19 +83,23 @@ def run(args):
             if len(v.ALT) > 1:
                 continue
             gt_types = v.gt_types
-            if gt_types[ikid] != vcf.HET:
+            if gt_types[ikid] != HET:
                 continue
-            if gt_types[idad] == vcf.HET and gt_types[imom] == vcf.HOM_REF:
-                if filter_sites(v, idad) is not None and phased(v, d, d['sample_id']):
+            if gt_types[idad] == HET and gt_types[imom] == HOM_REF:
+                #if filter_sites(v, idad) is not None and phased(v, d, d['sample_id']):
+                if phased(v, d, d['sample_id']):
                     #d['dad-sites'].append("%s:%d-%d" % (v.CHROM, v.start+1, v.end))
-                    d['phased_parent'] = d['paternal_id'] 
-            elif gt_types[imom] == vcf.HET and gt_types[idad] == vcf.HOM_REF:
-                if filter_sites(v, imom) is not None and phased(v, d, d['sample_id']):
+                    d['phased_parent'] = d['paternal_id']
+            elif gt_types[imom] == HET and gt_types[idad] == HOM_REF:
+                #if filter_sites(v, imom) is not None and phased(v, d, d['sample_id']):
+                if phased(v, d, d['sample_id']):
                     #d['mom-sites'].append("%s:%d-%d" % (v.CHROM, v.start+1, v.end))
-                    d['phased_parent'] = d['maternal_id'] 
-
+                    d['phased_parent'] = d['maternal_id']
+            else:
+                d['phased_parent'] = '' 
         if i == 0:
             print("\t".join(d.keys()))
+        #d['phased_parent'] = '\t'.join(d['phased_parent'])
         print("\t".join(d.values()))
 
 if __name__ == "__main__":

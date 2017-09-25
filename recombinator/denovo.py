@@ -296,8 +296,11 @@ def get_denovo(v, sample_dict, kids, f2s=None,
             if f2s is not None:
                 f2_with_v = validate_in_f2(v, sample_dict, gts, kid, f2s)
             else: f2_with_v = []
+            p_dnm_in_f2s = 1 - 0.5 ** (len(f2s) - len(f2_with_v))
 
-            ret.extend(variant_info(v, kid, sample_dict, f2_with_v=f2_with_v, pab=pab, palt=palt, alt_i=k))
+            ret.extend(variant_info(v, kid, sample_dict, f2_with_v=f2_with_v, 
+                                                        pab=pab, palt=palt, alt_i=k,
+                                                        p_dnm_in_f2s=p_dnm_in_f2s))
 
 
     # shouldn't have multiple samples with same de novo.
@@ -306,7 +309,7 @@ def get_denovo(v, sample_dict, kids, f2s=None,
     if len(ret) == 1: return ret[0]
 
 def variant_info(v, kid, sample_dict, f2_with_v=[], 
-                    interval_type=None, pab=None, palt=None, alt_i=None):
+                    interval_type=None, pab=None, palt=None, alt_i=None, p_dnm_in_f2s=None):
 
     k_idx, mi, di = sample_dict[kid.sample_id], sample_dict[kid.mom.sample_id], sample_dict[kid.dad.sample_id]
 
@@ -364,6 +367,7 @@ def variant_info(v, kid, sample_dict, f2_with_v=[],
             ("call_rate", "%.3f" % v.call_rate),
             ("cohort_alt_depth", alt_sum),
             ("f2_with_variant", ','.join([str(x.sample_id) for x in f2_with_v])),
+            ("p_dnm_in_f2s", p_dnm_in_f2s),
             ))
 
 
@@ -378,7 +382,7 @@ def denovo(v, sample_dict, kids, f2s=None, max_alts_in_parents=5,
         exclude=None,
         HET=1):
     if not variant_prefilter(v, 10): return None
-    return get_denovo(v, sample_dict, kids, f2s=None, max_alts_in_parents=max_alts_in_parents,
+    return get_denovo(v, sample_dict, kids, f2s=f2s, max_alts_in_parents=max_alts_in_parents,
             min_depth=min_depth,
             max_mean_depth=max_mean_depth,
             min_allele_balance_p=min_allele_balance_p,
@@ -422,7 +426,6 @@ def run(args):
         kids = f2s
         f2s = None
     else: kids = f1s
-
     _use_cohort_filters = False if os.environ.get("DN_NO_COHORT") else True
 
     n_dn = 0
