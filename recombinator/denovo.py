@@ -232,16 +232,30 @@ def get_denovo(v, sample_dict, kids, f2s=None,
                                                         p_dnm_in_f2s=p_dnm_in_f2s))
             """
             ##### END EICHLER FILTERS
+            
+            # TODO: check why some quals are 0 and if filtering on this improve
+            # accuracy.
+            quals = v.gt_quals
+            quals[quals < 0] == 0
+            if quals[k_idx] < min_qual or quals[mi] < min_qual or quals[di] < min_qual: continue
 
             # If we're looking for DNMs in the F2 generation,
             # we don't expect to see this DNM *anywhere* else in the cohort.
-            if f2s is None and v.num_het > 5:
-                continue
+            # At the same time, we only really want to filter out HETs that have
+            # a decent GQ, and are really "HETs".
+            het_idxs = np.where(gts == 1)[0]
+            het_idxs_outside_kid = het_idxs[np.where(het_idxs != k_idx)[0]]
+            if f2s is None:
+                het_gt_quals = quals[het_idxs_outside_kid]
+                het_above_qual = np.where(het_gt_quals > 20)[0].shape[0]
+                if het_above_qual > 5: continue
+
             # Special logic for X chromosome.
             if kid.sex == 'male' and v.CHROM == 'X':
                 if gts[k_idx] != 3: continue
             else:
                 if gts[k_idx] != 1: continue
+                if v.num_hom_alt > 0: continue
             # check that parents are hom-ref
             if not (gts[di] == 0 and gts[mi] == 0):
                 continue
@@ -252,11 +266,15 @@ def get_denovo(v, sample_dict, kids, f2s=None,
             f2_idxs = []
             
             # List of peddy.Samples() that represent children of the f1 we're looping over.
-            # Assuming there are any, ofcourse.
             if f2s is not None:
                 f2s = [k for k in f2s if kid.sample_id in [k.mom.sample_id, k.dad.sample_id]]
                 f2_idxs = [sample_dict[k.sample_id] for k in f2s]
-
+                het_idxs_outside_fam = np.array([x for x in het_idxs_outside_kid if x not in f2_idxs])
+                try:
+                    het_gt_quals = quals[het_idxs_outside_fam]
+                    het_above_qual = np.where(het_gt_quals > 20)[0].shape[0]
+                    if het_above_qual > 5: continue
+                except IndexError: het_above_qual = 0 
                 # Total number of ALT alleles in F2s.
                 #ac_dict = {3:2, 2:0, 1:1, 0:0}
                 #ac_in_f2s = sum([ac_dict[gts[i]] for i in f2_idxs])
@@ -267,7 +285,8 @@ def get_denovo(v, sample_dict, kids, f2s=None,
                 f2_with_v = validate_in_f2(v, sample_dict, gts, kid, f2s)
                 p_dnm_in_f2s = 1 - 0.5 ** (len(f2s) - len(f2_with_v))
 
-            if f2s is not None and v.num_het - len(f2_with_v) - 1 > 4:
+            # allow for 2 other HETs outside of the family of F1 and F2
+            if f2s is not None and v.num_het - len(f2_with_v) - 1 > 10:
                 continue
 
             # NOTE: removed this for "lenient" calling 
@@ -296,11 +315,6 @@ def get_denovo(v, sample_dict, kids, f2s=None,
             
             ab = k_alt / (k_alt + k_ref)
             if not (min_allele_balance < ab < max_allele_balance): continue
-            # TODO: check why some quals are 0 and if filtering on this improve
-            # accuracy.
-            quals = v.gt_quals
-            quals[quals < 0] == 0
-            if quals[k_idx] < min_qual or quals[mi] < min_qual or quals[di] < min_qual: continue
             
             # stricter settings with FILTER
             # Note: seems as though FILTER is always None...
@@ -329,7 +343,8 @@ def get_denovo(v, sample_dict, kids, f2s=None,
             ret.extend(variant_info(v, kid, sample_dict, f2_with_v=f2_with_v, 
                                                         palt=palt, alt_i=k,
                                                         p_dnm_in_f2s=p_dnm_in_f2s,
-                                                        ref_sb=ref_sb, alt_sb=alt_sb))
+                                                        ref_sb=ref_sb, alt_sb=alt_sb,
+                                                        num_het_outside_fam=het_above_qual))
             
 
     # shouldn't have multiple samples with same de novo.
@@ -339,7 +354,7 @@ def get_denovo(v, sample_dict, kids, f2s=None,
 
 def variant_info(v, kid, sample_dict, f2_with_v=[], 
                     interval_type=None, palt=None, alt_i=None, p_dnm_in_f2s=None,
-                    ref_sb=None, alt_sb=None):
+                    ref_sb=None, alt_sb=None, num_het_outside_fam=None):
 
     k_idx, mi, di = sample_dict[kid.sample_id], sample_dict[kid.mom.sample_id], sample_dict[kid.dad.sample_id]
 
@@ -373,7 +388,7 @@ def variant_info(v, kid, sample_dict, f2_with_v=[],
             ("ref", v.REF),
             ("alt", v.ALT[k]),
             ("alt_i", "%d/%d" % (k, len(v.ALT))),
-            ("num_het", v.num_het),
+            ("num_het_outside_fam", num_het_outside_fam),
             ("num_hom_alt", v.num_hom_alt),
             ("allele_number", v.INFO.get("AN")),
             ("filter", v.FILTER or "PASS"),
@@ -383,6 +398,7 @@ def variant_info(v, kid, sample_dict, f2_with_v=[],
             ("kid_ref_depth", k_ref),
             ("kid_alt_depth", k_alt),
             ("kid_total_depth", k_ref + k_alt),
+            ("kid_allele_balance", k_alt / float(k_alt + k_ref)),
             ("mom_ref_depth", ref_depths[mi]),
             ("mom_alt_depth", alt_depths[mi]),
             ("mom_total_depth", ref_depths[mi] + alt_depths[mi]),
@@ -500,7 +516,6 @@ def main(argv):
     p = ArgumentParser()
     p.add_argument("--chrom", help="extract only this chromosome", default=None)
     p.add_argument("-exclude", help="BED file of regions to exclude (e.g. LCRs)")
-    p.add_argument("-f2", help="if we're looking for DNM in the F2s", action="store_true")
     p.add_argument("-min_depth", help="min depth in kid and both parents [10]", type=int, default=10)
     p.add_argument("-min_allele_balance", help="min allele balance [0.15]", type=float, default=0.25)
     p.add_argument("-min_cohort_enrich_p", help="min p-value reqd for binomial test of variant cohort enrichment [0.05]", type=float, default=0.05)
