@@ -13,6 +13,7 @@ def main(argv):
     p = argparse.ArgumentParser()
     p.add_argument("--fragment-length", type=int, default=350, help="library fragment length")
     p.add_argument("--ped-file", required=True, help="optional ped file if parents aren't specified in denovo file")
+    p.add_argument("-chrom")
     p.add_argument("bed", help="bed file of denovos with a column header for 'chrom,start,end,sample_id")
     p.add_argument("vcf")
     args = p.parse_args(argv)
@@ -44,6 +45,7 @@ def phased(v, d, kid_id, het=True, prefix="/scratch/ucgd/lustre/ugpuser/Reposito
         for pileupread in pileupcolumn.pileups:
             # ignore reads with indels w/r/t the reference
             if pileupread.is_del or pileupread.is_refskip: continue
+            if pileupread.alignment.mapping_quality < 60: continue
             # get the alignment's sequence
             l_query_seq = pileupread.alignment.query_sequence
             l_start, l_end = pileupread.alignment.reference_start, pileupread.alignment.reference_end
@@ -115,12 +117,15 @@ def run(args):
 
     for i, d in enumerate(ts.reader(args.bed, header="ordered")):
 
+        if args.chrom and d['chrom'] != args.chrom: continue
+
         idad = sample_to_dad[d['sample_id']]
         imom = sample_to_mom[d['sample_id']]
         ikid = sample_lookup[d['sample_id']]
         # loop over all variants in the VCF +/- 350 bp from the 
         # known DNM
         phased_parent, phased_variant = ' ', ' '
+        evidence = ' '
         for v in get_position(vcf, d, extra=args.fragment_length):
             if len(v.REF) > 1: continue
             if len(v.ALT[0]) > 1: continue
@@ -130,8 +135,9 @@ def run(args):
             if gt_types[idad] in (HET, HOM_ALT) and gt_types[imom] == HOM_REF:
                 #if filter_sites(v, idad) is not None and phased(v, d, d['sample_id']):
                 dad_evidence, mom_evidence = phased(v, d, d['sample_id'])
+                if mom_evidence + dad_evidence < 2: continue
                     #d['dad-sites'].append("%s:%d-%d" % (v.CHROM, v.start+1, v.end))
-                if dad_evidence > mom_evidence:
+                if dad_evidence > mom_evidence: 
                     phased_parent = d['paternal_id']
                 # assume that if no evidence on paternal ID (and it's a HET), must
                 # be from mom.
@@ -139,19 +145,23 @@ def run(args):
                 elif dad_evidence < mom_evidence:
                     phased_parent = d['maternal_id']
                 else: continue
+                evidence = str(dad_evidence) + ',' + str(mom_evidence)
                 phased_variant = str(v.start)
             elif gt_types[imom] in (HET, HOM_ALT) and gt_types[idad] == HOM_REF:
                 #if filter_sites(v, imom) is not None and phased(v, d, d['sample_id']):
                 mom_evidence, dad_evidence = phased(v, d, d['sample_id'])
+                if mom_evidence + dad_evidence < 5: continue
                 if mom_evidence > dad_evidence:
                     #d['mom-sites'].append("%s:%d-%d" % (v.CHROM, v.start+1, v.end))
                     phased_parent = d['maternal_id']
                 elif mom_evidence < dad_evidence:
                     phased_parent = d['paternal_id']
                 else: continue
+                evidence = str(dad_evidence) + ',' + str(mom_evidence)
                 phased_variant = str(v.start)
         d['phased_parent'] = phased_parent
         d['phased_variant'] = phased_variant
+        d['evidence_count_p,m'] = evidence
         if i == 0:
             print("\t".join(d.keys()))
         #d['phased_parent'] = '\t'.join(d['phased_parent'])

@@ -69,7 +69,7 @@ def read_exclude(path, chrom=None):
             continue
         added += 1
         # NOTE: made the 'other' value equal to whatever annotation I put as the
-        # fourth field in the exclude BED file
+        # fourth field in the exclude BED file, such as SINE/LINE identity
         try: 
             tree[toks[0]].add(int(toks[1]), int(toks[2]), other=toks[3])
         except:
