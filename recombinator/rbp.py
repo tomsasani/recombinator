@@ -3,107 +3,116 @@ import sys
 import pysam
 import toolshed as ts
 from cyvcf2 import VCF
+from peddy import Ped
 from collections import defaultdict
 import scipy.stats as ss
-from .var_info import get_position
-
 
 def main(argv):
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--fragment-length", type=int, default=350, help="library fragment length")
-    p.add_argument("--ped-file", required=True, help="optional ped file if parents aren't specified in denovo file")
+    p.add_argument("-fragment-length", type=int, default=500, help="library fragment length")
     p.add_argument("-chrom")
+    p.add_argument("-prefix", help='path to directory containing BAM files, formatted as <sample_name.bam>', default="/scratch/ucgd/lustre/ugpuser/Repository/AnalysisData/2016/A414/16-08-06_WashU-Yandell-CEPH/UGP/Data/PolishedBams/")
     p.add_argument("bed", help="bed file of denovos with a column header for 'chrom,start,end,sample_id")
-    p.add_argument("vcf")
+    p.add_argument("vcf", help="VCF file containing (at least) all variants for the trio samples")
     args = p.parse_args(argv)
     run(args)
 
-def phased(v, d, kid_id, het=True, prefix="/scratch/ucgd/lustre/ugpuser/Repository/AnalysisData/2016/A414/16-08-06_WashU-Yandell-CEPH/UGP/Data/PolishedBams/"):
+def get_position(vcf, d, ref=None, alt=None, extra=0):
+    loc = "%s:%d-%d" % (d['chrom'], int(d['start']) + 1 - extra,
+                        int(d['end']) + extra)
+    for v in vcf(loc):
+        if ref and v.REF != ref: continue
+        if alt and alt not in v.ALT: continue
+        yield v
+
+def calculate_evidence(v, d, inf_base='A', dnm_base='T'):
+
+    parent_evidence, other_parent_evidence = 0, 0
+
+    if inf_base.upper() == v.ALT[0].upper() and dnm_base == d['alt']:
+        parent_evidence += 1
+    # if the read supports the reference at both sites, we know that other reads with
+    # the DNM are phased with the alternate allele.
+    elif inf_base.upper() == v.REF.upper() and dnm_base == d['ref']:
+        parent_evidence += 1
+    # NOTE: evidence for other parent's chromosome, if
+    # the read supports the DNM (d[alt]) but has reference support at the
+    # putative HET variant
+    elif inf_base.upper() == v.REF.upper() and dnm_base == d['alt']:
+        other_parent_evidence += 1
+
+    return parent_evidence, other_parent_evidence
+
+def high_quality_site(v, i, sex='male', min_depth=10, min_ab=0.25):
+    min_ab = 0.75 if v.CHROM == 'X' and sex == 'male' else min_ab
+    ref_depths, alt_depths = v.gt_ref_depths, v.gt_alt_depths
+    if alt_depths[i] / float(ref_depths[i] + alt_depths[i]) < min_ab: 
+        return False
+    if ref_depths[i] + alt_depths[i] < min_depth:
+        return False
+    return True
+
+def phased(v, d, kid_id, prefix="./"):
 
     read_names = defaultdict() 
 
     parent_evidence, other_parent_evidence = 0, 0
 
-    rcdict = {'A':'T', 'C':'G', 'G':'C', 'T':'A', 'N':'N'}
-    # The putative HET variant in mom/dad we're interested in phasing with...
-    het_reference_pos = int(v.POS) - 1 
+    # The informative variant in mom/dad we're interested in phasing with...
+    inf_ref_pos = v.start
     # ...the DNM we've already identified as HET in the kid.
-    dnm_reference_pos = int(d['start']) 
-    dist = het_reference_pos - dnm_reference_pos
+    dnm_ref_pos = int(d['start']) 
+    dist = inf_ref_pos - dnm_ref_pos
 
     bam = pysam.AlignmentFile(prefix + kid_id + ".bam", "rb")
 
     # loop over pileups in the BAM until we hit the position of the putative HET to phase with
-    for pileupcolumn in bam.pileup(v.CHROM, min(het_reference_pos, dnm_reference_pos),
-            max(het_reference_pos, dnm_reference_pos)):
-        if pileupcolumn.pos != het_reference_pos:
-            continue
-        # for every read that spans the putative HET to phase,
+    for pileupcolumn in bam.pileup(v.CHROM, min(inf_ref_pos, dnm_ref_pos),
+            max(inf_ref_pos, dnm_ref_pos)):
+        # do everything w/r/t the informative site
+        if pileupcolumn.pos != inf_ref_pos: continue
+        # for every read that spans the informative site,
         # check that the read has support for both the putative HET
         # AND the known DNM.
         for pileupread in pileupcolumn.pileups:
             # ignore reads with indels w/r/t the reference
             if pileupread.is_del or pileupread.is_refskip: continue
-            if pileupread.alignment.mapping_quality < 60: continue
+            if pileupread.alignment.mapping_quality < 20: continue
             # get the alignment's sequence
             l_query_seq = pileupread.alignment.query_sequence
             l_start, l_end = pileupread.alignment.reference_start, pileupread.alignment.reference_end
-            # if we can access the read's mate, grab it
-            try: mate = bam.mate(pileupread.alignment)
-            except ValueError: continue
-            r_query_seq = mate.query_sequence
-            r_start, r_end = mate.reference_start, mate.reference_end
 
-            # l_range stores the positions the _current read_ is aligned to
-            # r_range stores the positions the _mate_ is aligned to
-            l_range = list(range(l_start, l_end))
-            r_range = list(range(r_start, r_end))
-            insert = max(l_start, r_start) - min(l_end, r_end)
+            inf_query_pos = pileupread.query_position
+            inf_query_base = l_query_seq[inf_query_pos]
 
-            # if the DNM we're trying to phase isn't contained in either the
-            # mate's or its pair's alignments, move on
-            if dnm_reference_pos not in l_range and dnm_reference_pos not in r_range: continue
-           
-            het_query_pos = pileupread.query_position
-            # position of known DNM
-            dnm_query_pos = het_query_pos - dist
-            # query base at putative HET variant
-            query_het_base = l_query_seq[het_query_pos]
-            # DNM position is in the mate's alignments
-            if dnm_reference_pos in r_range:
+            # if only one of the two variant sites are in the same read
+            if dnm_ref_pos not in range(l_start, l_end):
+                try: mate = bam.mate(pileupread.alignment)
+                # if we can't find the mate, we can't phase this variant
+                except ValueError: continue
+                r_query_seq = mate.query_sequence
+                r_start, r_end = mate.reference_start, mate.reference_end
+                # if the DNM isn't in the mate sequence, either, skip
+                if dnm_ref_pos not in range(r_start, r_end): continue
+                dnm_query_pos = dnm_ref_pos - r_start
                 try:
-                    dnm_query_pos = dnm_reference_pos - r_start
-                    query_dnm_base = r_query_seq[dnm_query_pos]
-                except IndexError:
-                    continue
-            elif dnm_reference_pos in l_range:
-                # query base at known DNM
+                    dnm_query_base = r_query_seq[dnm_query_pos]
+                except IndexError: continue
+
+                p, o = calculate_evidence(v, d, inf_base=inf_query_base, dnm_base=dnm_query_base)
+                parent_evidence += p
+                other_parent_evidence += o
+            else:
+                dnm_query_pos = inf_query_pos - dist
                 try:
-                    query_dnm_base = l_query_seq[dnm_query_pos]
-                except IndexError:
-                    continue
-            if query_het_base.upper() == v.ALT[0].upper() and query_dnm_base == d['alt']:
-                parent_evidence += 1
-            # if the read supports the reference at both sites, we know that other reads with
-            # the DNM are phased with the alternate allele.
-            elif query_het_base.upper() == v.REF.upper() and query_dnm_base == d['ref']:
-                parent_evidence += 1
-            # NOTE: evidence for other parent's chromosome, if
-            # the read supports the DNM (d[alt]) but has reference support at the
-            # putative HET variant
-            elif het and query_het_base.upper() == v.REF[0].upper() and query_dnm_base == d['alt']:
-                other_parent_evidence += 1
+                    dnm_query_base = l_query_seq[dnm_query_pos]
+                except IndexError: continue
+                p, o = calculate_evidence(v, d, inf_base=inf_query_base, dnm_base=dnm_query_base)
+                parent_evidence += p
+                other_parent_evidence += o
 
     return parent_evidence, other_parent_evidence
-
-def filter_sites(v, i, min_depth=10, min_ab=0.1):
-    ref_depths, alt_depths = v.gt_ref_depths, v.gt_alt_depths
-    if alt_depths[i] / float(ref_depths[i] + alt_depths[i]) < min_ab: 
-        return None
-    if ref_depths[i] + alt_depths[i] < min_depth:
-        return None
-    return True
 
 def run(args):
 
@@ -112,31 +121,33 @@ def run(args):
     vcf = VCF(args.vcf)
     sample_lookup = {s: i for i, s in enumerate(vcf.samples)}
 
-    sample_to_dad = {toks[1]: sample_lookup.get(toks[2]) for toks in ts.reader(args.ped_file, header=False)}
-    sample_to_mom = {toks[1]: sample_lookup.get(toks[3]) for toks in ts.reader(args.ped_file, header=False)}
-
     for i, d in enumerate(ts.reader(args.bed, header="ordered")):
 
         if args.chrom and d['chrom'] != args.chrom: continue
 
-        idad = sample_to_dad[d['sample_id']]
-        imom = sample_to_mom[d['sample_id']]
         ikid = sample_lookup[d['sample_id']]
-        # loop over all variants in the VCF +/- 350 bp from the 
-        # known DNM
-        phased_parent, phased_variant = ' ', ' '
-        evidence = ' '
+        idad = sample_lookup[d['paternal_id']]
+        imom = sample_lookup[d['maternal_id']]
+
+        # loop over all variants in the VCF +/- 350 bp from the DNM
+        phased_parent, phased_variant = '', ''
+        evidence = '' 
         for v in get_position(vcf, d, extra=args.fragment_length):
+            # ignore more complex variants for now
             if len(v.REF) > 1: continue
             if len(v.ALT[0]) > 1: continue
             gt_types = v.gt_types
-            if gt_types[ikid] != HET:
-                continue
+            # special logic for male chrX (hemizygous) variants
+            is_male = d['sample_sex'] == 'male'
+            if v.CHROM == 'X' and is_male and gt_types[ikid] != HOM_ALT: continue
+            else:
+                if gt_types[ikid] != HET: continue
+
             if gt_types[idad] in (HET, HOM_ALT) and gt_types[imom] == HOM_REF:
-                #if filter_sites(v, idad) is not None and phased(v, d, d['sample_id']):
-                dad_evidence, mom_evidence = phased(v, d, d['sample_id'])
-                if mom_evidence + dad_evidence < 2: continue
-                    #d['dad-sites'].append("%s:%d-%d" % (v.CHROM, v.start+1, v.end))
+                if not high_quality_site(v, idad): continue
+                dad_evidence, mom_evidence = phased(v, d, d['sample_id'], prefix=args.prefix)
+                if mom_evidence + dad_evidence < 3: continue
+                if abs(mom_evidence - dad_evidence) != max([mom_evidence, dad_evidence]): continue
                 if dad_evidence > mom_evidence: 
                     phased_parent = d['paternal_id']
                 # assume that if no evidence on paternal ID (and it's a HET), must
@@ -147,24 +158,25 @@ def run(args):
                 else: continue
                 evidence = str(dad_evidence) + ',' + str(mom_evidence)
                 phased_variant = str(v.start)
+
             elif gt_types[imom] in (HET, HOM_ALT) and gt_types[idad] == HOM_REF:
-                #if filter_sites(v, imom) is not None and phased(v, d, d['sample_id']):
-                mom_evidence, dad_evidence = phased(v, d, d['sample_id'])
-                if mom_evidence + dad_evidence < 5: continue
+                if not high_quality_site(v, imom, sex='female'): continue
+                mom_evidence, dad_evidence = phased(v, d, d['sample_id'], prefix=args.prefix)
+                if mom_evidence + dad_evidence < 3: continue
+                if abs(mom_evidence - dad_evidence) != max([mom_evidence, dad_evidence]): continue
                 if mom_evidence > dad_evidence:
-                    #d['mom-sites'].append("%s:%d-%d" % (v.CHROM, v.start+1, v.end))
                     phased_parent = d['maternal_id']
                 elif mom_evidence < dad_evidence:
                     phased_parent = d['paternal_id']
                 else: continue
                 evidence = str(dad_evidence) + ',' + str(mom_evidence)
                 phased_variant = str(v.start)
+
         d['phased_parent'] = phased_parent
         d['phased_variant'] = phased_variant
         d['evidence_count_p,m'] = evidence
         if i == 0:
             print("\t".join(d.keys()))
-        #d['phased_parent'] = '\t'.join(d['phased_parent'])
         print("\t".join(d.values()))
 
 if __name__ == "__main__":

@@ -25,62 +25,60 @@ def tranche99(filt, cutoff=99.6):
         return False
 
 def variant_prefilter(v, min_variant_qual):
-    if len(v.REF) > 15: return False
-    if len(v.ALT) > 2 or "*" in v.ALT: return False
-    if len(v.ALT[0]) > 15: return False
-    if v.FILTER is not None and not tranche99(v.FILTER): return False
+    #if len(v.REF) > 10: return False
+    #if len(v.ALT) > 2 or "*" in v.ALT: return False
+    if "*" in v.ALT: return False
+    #if len(v.ALT[0]) > 10: return False
+    #if v.FILTER is not None and not tranche99(v.FILTER): return False
 
     if v.QUAL < min_variant_qual: return False
-    if type(v.INFO.get('AC')) is int:
-        if v.INFO.get('AC') > 300: return False
-    else:
-        if min(v.INFO.get('AC')) > 300: return False
     return True
 
-def validate_in_f2(v, sample_dict, gts, kid, f2s, multiallelic=False):
+def validate_in_f2(v, sample_dict, gts, kid, f2s, f1_dnm_allele=1):
     """
     at this point, the variant is a solid putative DNM. now need
     to validate that it's in at least one of the f2s. all of the
     previous filters were on a population basis, so for now we'll only
     check if one of the kids is a HET
     """
+
+    f1_is_mom = kid.sex == 'female'
+    f1_is_dad = kid.sex == 'male'
     # define genotypes
     UNKNOWN = (-1, -1)
     HOM_REF = (0, 0)
-    HET = (0, 1)
-    HOM_ALT = (1, 1) 
-
-    if multiallelic:
-        HET = (0, 2)
-        HOM_ALT = (2, 2)
-    
+    f1_dnm_allele=f1_dnm_allele[0] 
     quals = v.gt_quals
     f2_with_v = []
     for f2 in f2s:
+        if kid.sample_id not in [f2.mom.sample_id, f2.dad.sample_id]: continue
+
         f2_idx = sample_dict[f2.sample_id]
         mi, di = sample_dict[f2.mom.sample_id], sample_dict[f2.dad.sample_id]
-
+        
         m_gt, d_gt = (gts[mi][0], gts[mi][1]), (gts[di][0], gts[di][1])
         f2_gt = (gts[f2_idx][0], gts[f2_idx][1])
         if any([x == UNKNOWN for x in (m_gt, d_gt)]): continue
-        if kid.sample_id not in [f2.mom.sample_id, f2.dad.sample_id]: continue
+
         # Make sure that the F1's partner doesn't also have the same DNM
         # Actually, this is possible? But extreeeeemely unlikely. This check only
         # works if we don't look at the X.
+        if f1_is_mom and f1_dnm_allele in d_gt: continue
+        elif f1_is_dad and f1_dnm_allele in m_gt: continue
+        else: pass
+
         if v.CHROM != 'X':
-            if multiallelic and sum([sum(x) for x in (m_gt, d_gt)]) > 2: continue
-            elif not multiallelic and sum([sum(x) for x in (m_gt, d_gt)]) > 1: continue
-            if f2_gt != HET: continue
+            if list(f2_gt).count(f1_dnm_allele) != 1: continue
         # Special logic for inherited DNM on male X.
         elif v.CHROM == 'X':
             # Female F1 with DNM passes it on to male F2, must be
             # homozygous in the F2.
             if kid.sex == 'female' and f2.sex == 'male':
-                if f2_gt != HOM_ALT: continue 
+                if not all([x == f1_dnm_allele for x in list(f2_gt)]): continue 
             # Male F1 with DNM on X simply cannot pass it onto male F2.
             elif kid.sex == 'male' and f2.sex == 'male': continue
             else:
-                if f2_gt != HET: continue
+                if list(f2_gt).count(f1_dnm_allele) != 1: continue
 
         f2_with_v.append(f2)
 
@@ -142,42 +140,36 @@ def get_denovo(v, sample_dict, p0, f1s, f2s,
             mi, di = sample_dict[kid.mom.sample_id], sample_dict[kid.dad.sample_id]
 
             if v.CHROM == 'Y': continue # ignore Y for now
-
             # define genotypes
             UNKNOWN = (-1, -1)
             HOM_REF = (0, 0)
-            HET = (0, 1)
-            HOM_ALT = (1, 1) 
             
-            multiallelic = False
-            if alt_index > 0: 
-                multiallelic = True
-                HET = (0, 2)
-                HOM_ALT = (2, 2)
-
             k_gt, m_gt, d_gt = (gts[ki][0], gts[ki][1]),\
                                (gts[mi][0], gts[mi][1]),\
                                (gts[di][0], gts[di][1])
+
+            # get a list of the parent genotypes, which we'll compare to the kid's genotype
+            parent_gts = list(m_gt)
+            parent_gts.extend(list(d_gt))
             
-            
+            # if the kid has a genotype that's not observed in either parent, it's de novo
+            uniq_gt_in_kid = any([x not in parent_gts for x in list(k_gt)])
+            f1_dnm_allele = [a for a in list(k_gt) if a not in parent_gts]
+
+            if not uniq_gt_in_kid: continue
+            if alt_index + 1 != f1_dnm_allele[0]: continue
+
+            # can't be confident in any genotypes that are UNKNOWN
             if any([gt == UNKNOWN for gt in (k_gt, m_gt, d_gt)]): continue
 
-            
-            p_hom_ref, p_hom_alt = True, False
-            if d_gt == HOM_REF and m_gt == HOM_REF: p_hom_ref = True
-            elif d_gt == HOM_ALT and m_gt == HOM_ALT: p_hom_alt = True
-            else: continue
+            kid_is_hom = len(set(k_gt)) == 1
+            kid_is_het = len(set(k_gt)) == 2
 
             # check that kid is a HET (or HOM_ALT on hemizygous chroms in males)
             if kid.sex == 'male' and v.CHROM == 'X':
-                # check that parents are homozygous
-                if p_hom_ref:
-                    if k_gt != HOM_ALT: continue
-                elif p_hom_alt:
-                    if k_gt != HOM_REF: continue
+                if not kid_is_hom: continue
             else:
-                if k_gt != HET: continue
-                # check that parents are homozygous
+                if not kid_is_het: continue
 
             quals = v.gt_quals
             quals[quals < 0] == 0
@@ -207,41 +199,43 @@ def get_denovo(v, sample_dict, p0, f1s, f2s,
             children = []
             if multigen:
                 children = [k for k in f2s if kid.sample_id in (k.dad.sample_id, k.mom.sample_id)]
-           
+                       
             family_idxs = [sample_dict[k.sample_id] for k in all_samples if k.family_id == kid.family_id]
-            gt_to_filter = HET
+            #print ('allele to filter is {}'.format(allele_to_filter))
             # NOTE: what about if the X variant is HOM_ALT in the guy, it could still be present
             # as a DNM in a female in the cohort as a HET?
-            if v.CHROM == 'X' and kid.sex == 'male': gt_to_filter = HOM_ALT
+            #if v.CHROM == 'X' and kid.sex == 'male': gt_to_filter = k_gt
 
             possible_carriers = 0 # genotype only
             likely_carriers = 0 # must meet QUAL and AB threshold
+
+            allele_to_filter = f1_dnm_allele[0]
 
             for sample in all_samples:
                 if sample.family_id == kid.family_id: continue
                 sample_idx = sample_dict[sample.sample_id]
                 genotype = gts[sample_idx]
                 genotype_ = (genotype[0], genotype[1])
-                if genotype_ != gt_to_filter: continue
+                if allele_to_filter not in genotype_: continue
                 possible_carriers += 1
                 sample_ref = ref_depths[sample_idx]
                 sample_alt = alt_depths[sample_idx]
                 sample_total = float(sample_ref + sample_alt)
                 sample_qual = quals[sample_idx]
 
-                if sample_qual < 10: continue
+                if sample_qual < 20: continue
                 if sample_total < 10: continue
-                if gt_to_filter == HOM_ALT:
+                if kid_is_hom:
                     if sample_alt / sample_total < 0.75: continue
-                elif gt_to_filter == HET:
+                elif kid_is_het:
                     if not 0.25 <= (sample_alt / sample_total) <= 0.75: continue
                 likely_carriers += 1
             possible_carriers -= likely_carriers
-
+            
             # check for inheritance of the DNM in a third generation
             putative_f2_with_v = []
             if multigen:
-                putative_f2_with_v = validate_in_f2(v, sample_dict, gts, kid, children, multiallelic=multiallelic)
+                putative_f2_with_v = validate_in_f2(v, sample_dict, gts, kid, children, f1_dnm_allele=f1_dnm_allele)
 
             f2_with_v = []
             f2_with_v_ab = []
@@ -259,13 +253,13 @@ def get_denovo(v, sample_dict, p0, f1s, f2s,
                 f2_with_v_gq.append(quals[f2_idx])
                 f2_with_v_dp.append(total_depth)
 
-            ret.extend(variant_info(v, kid, sample_dict, possible_carriers=possible_carriers,
-                                                         likely_carriers=likely_carriers,
-                                                         f2_with_v=f2_with_v, 
+            ret.extend(variant_info(v, kid, sample_dict, f2_with_v=f2_with_v, 
                                                          f2_with_v_ab=f2_with_v_ab,
                                                          f2_with_v_gq=f2_with_v_gq,
                                                          f2_with_v_dp=f2_with_v_dp,
-                                                         alt_i=alt_index))
+                                                         alt_i=alt_index,
+                                                         possible_carriers=possible_carriers,
+                                                         likely_carriers=likely_carriers))
     # assuming you have multiallelics        
     if len(ret) > 0: 
         return ret
@@ -420,7 +414,6 @@ def run(args):
         simons_prefix = True
     n_dn = 0
     for i, v in enumerate(vcf(str(args.chrom)) if args.chrom else vcf, start=1):
-        if float(v.INFO.get("MQ")) < 30: continue
         if i % 10000 == 0:
             print(" called %d de-novos out of %d variants" % (n_dn, i), file=sys.stderr)
 

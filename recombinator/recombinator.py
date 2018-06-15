@@ -39,7 +39,6 @@ def filter_main(argv):
     p.add_argument("--no-plot", dest="plot", action="store_false", default=True, help="dont make per-sample plots")
     p.add_argument("-p", "--processes", type=int, default=24, help="number of processes")
     p.add_argument("sites", nargs="+", help=".bed.gz files containing state at each informative site")
-
     args = p.parse_args(argv)
     try:
         os.makedirs(os.path.dirname(args.prefix))
