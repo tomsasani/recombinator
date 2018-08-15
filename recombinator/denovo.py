@@ -25,58 +25,57 @@ def tranche99(filt, cutoff=99.6):
         return False
 
 def variant_prefilter(v, min_variant_qual):
-    #if len(v.REF) > 10: return False
-    #if len(v.ALT) > 2 or "*" in v.ALT: return False
     if "*" in v.ALT: return False
-    #if len(v.ALT[0]) > 10: return False
+    if len(v.REF) > 10: return False
+    # require FILTER to meet minimum tranche requirement
     #if v.FILTER is not None and not tranche99(v.FILTER): return False
-
     if v.QUAL < min_variant_qual: return False
     return True
 
-def validate_in_f2(v, sample_dict, gts, kid, f2s, f1_dnm_allele=1):
+def validate_in_f2(v, sample_dict, f1, children, f1_dnm_allele=1):
     """
-    at this point, the variant is a solid putative DNM. now need
-    to validate that it's in at least one of the f2s. all of the
-    previous filters were on a population basis, so for now we'll only
-    check if one of the kids is a HET
+    if calling DNMs in the F1 generation, count the
+    number of F2s that inherit that DNM
+
+    v: cyvcf2 "Variant" object
+    sample_dict: mapping of sample IDs to indices in the VCF FORMAT field 
+    f1: F1, represented as peddy "sample" object
+    children: list of peddy.Samples() for whom the F1 is a parent
+    f1_dnm_allele: the unique ALT allele present in the F1
     """
 
-    f1_is_mom = kid.sex == 'female'
-    f1_is_dad = kid.sex == 'male'
-    # define genotypes
+    f1_is_mom = f1.sex == 'female'
+    f1_is_dad = f1.sex == 'male'
+
+    # regardless of the DNM allele, below genotypes are constants
+    gts = v.genotypes
     UNKNOWN = (-1, -1)
     HOM_REF = (0, 0)
-    f1_dnm_allele=f1_dnm_allele[0] 
+
     quals = v.gt_quals
     f2_with_v = []
-    for f2 in f2s:
-        if kid.sample_id not in [f2.mom.sample_id, f2.dad.sample_id]: continue
-
+    
+    for f2 in children:
+        if f1.sample_id not in [f2.mom.sample_id, f2.dad.sample_id]: continue
         f2_idx = sample_dict[f2.sample_id]
         mi, di = sample_dict[f2.mom.sample_id], sample_dict[f2.dad.sample_id]
-        
+        # redefine genotypes as tuples    
         m_gt, d_gt = (gts[mi][0], gts[mi][1]), (gts[di][0], gts[di][1])
         f2_gt = (gts[f2_idx][0], gts[f2_idx][1])
         if any([x == UNKNOWN for x in (m_gt, d_gt)]): continue
-
-        # Make sure that the F1's partner doesn't also have the same DNM
-        # Actually, this is possible? But extreeeeemely unlikely. This check only
-        # works if we don't look at the X.
+        # make sure that the F1's spouse doesn't also have the DNM allele
         if f1_is_mom and f1_dnm_allele in d_gt: continue
         elif f1_is_dad and f1_dnm_allele in m_gt: continue
         else: pass
-
+        # if we're on an autosome, the F2 should be HET for the DNM
         if v.CHROM != 'X':
             if list(f2_gt).count(f1_dnm_allele) != 1: continue
-        # Special logic for inherited DNM on male X.
+        # if we're on the X, female F2s should be HET and male F2s should be HOM_ALT.
         elif v.CHROM == 'X':
-            # Female F1 with DNM passes it on to male F2, must be
-            # homozygous in the F2.
-            if kid.sex == 'female' and f2.sex == 'male':
-                if not all([x == f1_dnm_allele for x in list(f2_gt)]): continue 
-            # Male F1 with DNM on X simply cannot pass it onto male F2.
-            elif kid.sex == 'male' and f2.sex == 'male': continue
+            if f1.sex == 'female' and f2.sex == 'male':
+                if not list(f2_gt).count(f1_dnm_allele) == 2: continue 
+            # male F1 with DNM on X simply cannot pass it onto male F2
+            elif f1.sex == 'male' and f2.sex == 'male': continue
             else:
                 if list(f2_gt).count(f1_dnm_allele) != 1: continue
 
@@ -86,39 +85,31 @@ def validate_in_f2(v, sample_dict, gts, kid, f2s, f1_dnm_allele=1):
 
 def get_denovo(v, sample_dict, p0, f1s, f2s,
         min_depth=5,
-        max_mean_depth=400,
         min_qual=1,
         multigen=False,
         exclude=None,
-        _use_cohort_filters=True,
         simons_prefix=False,
-        eiee=False,
-        HET=1):
+        eiee=False):
     """
-    v: cyvcf2.Variant
-    samples: dictionary of sample: index in vcf.
+    v: cyvcf2 "Variant" object
+    sample_dict: mapping of sample IDs to indices in the VCF FORMAT field 
     f1s: list of peddy.Samples() that have parents, but not grandparents
     f2s: list of peddy.Samples() that have both parents and grandparents (we use these
     genotypes to corroborate de novo calls made in the F1s)
-    max_alts_in_parents: max number of alternate reads that can appear in the parents.
     min_depth: require all members of trio to have at least this depth.
-    min_allele_balance_p: if the p-value for ref, alt counts is less than this, exclude
-    min_depth_percentile: require all members of a trio to be in this percentile of depth.
     exclude: interval tree of regions to exclude.
-    _use_cohort_filters: if set to false then only use info within a family to
-    decide if a variant is denovo. don't use things like AF in the cohort.
     """
 
-    
+    if v.CHROM == 'Y': return None
     if exclude is not None:
         if len(exclude[v.CHROM].search(v.start, v.end)) > 0:
             return None
 
     ret = []
-    gts = v.genotypes # NOTE: changes v.gt_types to v.genotypes for multiallelics
    
     all_samples = p0 + f1s + f2s
     all_children = f1s + f2s
+    # define the "kids" (i.e., probands) in which we search for DNMs
     if multigen: kids = f1s
     else: kids = f2s
     if eiee or simons_prefix: kids = f1s
@@ -130,40 +121,43 @@ def get_denovo(v, sample_dict, p0, f1s, f2s,
     # loop over alternate alleles
     for alt_index, k in enumerate(v.ALT):
         alt_depths = None
-        # and then loop over the f1s. 
+        # and then loop over the kids. 
         for kid in kids:
-            # Added check since sample '8477' apparently doesn't exist in our ceph data
             if simons_prefix and 'SSC' not in kid.sample_id: continue
-            if kid.mom.sample_id == '8477' or kid.dad.sample_id == '8477':
-                continue
+            # sample '8477' was not included in CEPH sequencing
+            if kid.mom.sample_id == '8477' or kid.dad.sample_id == '8477': continue
             ki = sample_dict[kid.sample_id]
             mi, di = sample_dict[kid.mom.sample_id], sample_dict[kid.dad.sample_id]
 
-            if v.CHROM == 'Y': continue # ignore Y for now
             # define genotypes
             UNKNOWN = (-1, -1)
             HOM_REF = (0, 0)
             
+            gts = v.genotypes # NOTE: changed from v.gt_types for multiallelics
             k_gt, m_gt, d_gt = (gts[ki][0], gts[ki][1]),\
                                (gts[mi][0], gts[mi][1]),\
                                (gts[di][0], gts[di][1])
+            
+            # can't be confident in any genotypes that are UNKNOWN
+            if any([gt == UNKNOWN for gt in (k_gt, m_gt, d_gt)]): continue
 
-            # get a list of the parent genotypes, which we'll compare to the kid's genotype
+            # get a list of the parent genotypes, 
+            # which we'll compare to the kid's genotype
             parent_gts = list(m_gt)
             parent_gts.extend(list(d_gt))
             
             # if the kid has a genotype that's not observed in either parent, it's de novo
+            # this could happen in a number of ways...
+            # mom = (0, 0), dad = (0, 0), kid = (0, 1)
+            # mom = (1, 1), dad = (1, 3), kid = (1, 2) and so on
             uniq_gt_in_kid = any([x not in parent_gts for x in list(k_gt)])
-            f1_dnm_allele = [a for a in list(k_gt) if a not in parent_gts]
-
             if not uniq_gt_in_kid: continue
-            if alt_index + 1 != f1_dnm_allele[0]: continue
-
-            # can't be confident in any genotypes that are UNKNOWN
-            if any([gt == UNKNOWN for gt in (k_gt, m_gt, d_gt)]): continue
+            dnm_allele = [a for a in list(k_gt) if a not in parent_gts][0]
+            # if the DNM allele isn't the ALT allele we're currently looping over, move on
+            if alt_index + 1 != dnm_allele: continue
 
             kid_is_hom = len(set(k_gt)) == 1
-            kid_is_het = len(set(k_gt)) == 2
+            kid_is_het = len(set(k_gt)) == 2 
 
             # check that kid is a HET (or HOM_ALT on hemizygous chroms in males)
             if kid.sex == 'male' and v.CHROM == 'X':
@@ -173,8 +167,9 @@ def get_denovo(v, sample_dict, p0, f1s, f2s,
 
             quals = v.gt_quals
             quals[quals < 0] == 0
-            if quals[ki] < min_qual or quals[mi] < min_qual or quals[di] < min_qual: continue
-           
+            if any([quals[i] < min_qual for i in (ki, mi, di)]): continue
+          
+            # if we haven't already defined `depths`, do it now
             if depths is None:
                 ref_depths = v.gt_ref_depths
                 ref_depths[ref_depths < 0] = 0
@@ -185,64 +180,59 @@ def get_denovo(v, sample_dict, p0, f1s, f2s,
             m_alt, m_ref = alt_depths[mi], ref_depths[mi]
             d_alt, d_ref = alt_depths[di], ref_depths[di]
             k_alt, k_ref = alt_depths[ki], ref_depths[ki]
-            
-            # check total depth in mom, dad, and kid, and for lack of ALT support
-            if v.CHROM == 'X': norm_depth_by = 2.
-            else: norm_depth_by = 1.
+
+            # check total depth in mom, dad, and kid
+            # depth requirement is 1/2 of normal if we're on a hemizygous chromosome
+            # and the kid is male
+            norm_depth_by = 1.
+            if v.CHROM == 'X' and kid.sex == 'male': norm_depth_by = 2.
             if (m_ref + m_alt) < (min_depth / norm_depth_by): continue
             if (d_ref + d_alt) < (min_depth / norm_depth_by): continue 
             if (k_alt + k_ref) < (min_depth / norm_depth_by): continue
-
-            ab = k_alt / float(k_alt + k_ref)
-
-            # if we're looking in a third generation, kids (F1s) have children
-            children = []
-            if multigen:
-                children = [k for k in f2s if kid.sample_id in (k.dad.sample_id, k.mom.sample_id)]
-                       
-            family_idxs = [sample_dict[k.sample_id] for k in all_samples if k.family_id == kid.family_id]
-            #print ('allele to filter is {}'.format(allele_to_filter))
-            # NOTE: what about if the X variant is HOM_ALT in the guy, it could still be present
-            # as a DNM in a female in the cohort as a HET?
-            #if v.CHROM == 'X' and kid.sex == 'male': gt_to_filter = k_gt
-
+            
+            # loop over all samples outside of the family we're considering
+            # and count carriers of the DNM allele
             possible_carriers = 0 # genotype only
             likely_carriers = 0 # must meet QUAL and AB threshold
-
-            allele_to_filter = f1_dnm_allele[0]
-
+            
             for sample in all_samples:
                 if sample.family_id == kid.family_id: continue
                 sample_idx = sample_dict[sample.sample_id]
-                genotype = gts[sample_idx]
-                genotype_ = (genotype[0], genotype[1])
-                if allele_to_filter not in genotype_: continue
+                genotype = (gts[sample_idx][0], gts[sample_idx][1])
+                dnm_allele_count = list(genotype).count(dnm_allele)
+                if dnm_allele_count == 0: continue
+                if v.CHROM == 'X':
+                    if sample.sex == 'male' and dnm_allele_count != 2: continue
                 possible_carriers += 1
                 sample_ref = ref_depths[sample_idx]
                 sample_alt = alt_depths[sample_idx]
                 sample_total = float(sample_ref + sample_alt)
                 sample_qual = quals[sample_idx]
-
+                # "likely" carriers meet stricter threshold
                 if sample_qual < 20: continue
                 if sample_total < 10: continue
-                if kid_is_hom:
-                    if sample_alt / sample_total < 0.75: continue
-                elif kid_is_het:
+                if v.CHROM == 'X':
+                    if sample.sex == 'male' and sample_alt / sample_total < 0.75: continue
+                else:
                     if not 0.25 <= (sample_alt / sample_total) <= 0.75: continue
                 likely_carriers += 1
             possible_carriers -= likely_carriers
-            
+             
             # check for inheritance of the DNM in a third generation
+            children = []
+            if multigen:
+                children = [k for k in f2s if kid.sample_id in (k.dad.sample_id, k.mom.sample_id)]
+
             putative_f2_with_v = []
             if multigen:
-                putative_f2_with_v = validate_in_f2(v, sample_dict, gts, kid, children, f1_dnm_allele=f1_dnm_allele)
+                putative_f2_with_v = validate_in_f2(v, sample_dict, kid, children, 
+                                                    f1_dnm_allele=dnm_allele)
 
             f2_with_v = []
             f2_with_v_ab = []
             f2_with_v_gq = []
             f2_with_v_dp = []
-            # impose lenient filters on individuals that inherit the DNM
-            # track allele balance in transmission events to look for mosaics
+            # catalog allele balance, GQ, DP in transmission events
             for f2 in putative_f2_with_v:
                 f2_idx = sample_dict[f2.sample_id]
                 total_depth = alt_depths[f2_idx] + ref_depths[f2_idx]
@@ -260,21 +250,19 @@ def get_denovo(v, sample_dict, p0, f1s, f2s,
                                                          alt_i=alt_index,
                                                          possible_carriers=possible_carriers,
                                                          likely_carriers=likely_carriers))
-    # assuming you have multiallelics        
     if len(ret) > 0: 
         return ret
 
 def variant_info(v, kid, sample_dict, f2_with_v=[], f2_with_v_ab=[], f2_with_v_gq=[], f2_with_v_dp=[],
                     interval_type=None, alt_i=None, possible_carriers=0, likely_carriers=0):
 
-    ki, mi, di = sample_dict[kid.sample_id], sample_dict[kid.mom.sample_id], sample_dict[kid.dad.sample_id]
-
+    ki = sample_dict[kid.sample_id]
+    mi, di = sample_dict[kid.mom.sample_id], sample_dict[kid.dad.sample_id]
     f2_with_v_idx = [sample_dict[f2] for f2 in f2_with_v]
 
     ref_depths, alt_depths, quals = v.gt_ref_depths, v.gt_alt_depths, v.gt_quals
-
     k_ref, k_alt = ref_depths[ki], alt_depths[ki]
-
+    
     alt_sum = sum([alt_depths[i] for i in range(len(alt_depths)) if i not in f2_with_v_idx]) - k_alt
     ref_sum = sum([ref_depths[i] for i in range(len(ref_depths)) if i not in f2_with_v_idx]) - k_ref
 
@@ -286,7 +274,6 @@ def variant_info(v, kid, sample_dict, f2_with_v=[], f2_with_v_ab=[], f2_with_v_g
         mleaf_vcf = mleaf_vcf[alt_i]
         mleac_vcf = mleac_vcf[alt_i]
 
-
     f2s, f2_abs, f2_dps, f2_gqs = 'None', 'None', 'None', 'None'
 
     if len(f2_with_v) > 0:
@@ -294,7 +281,6 @@ def variant_info(v, kid, sample_dict, f2_with_v=[], f2_with_v_ab=[], f2_with_v_g
         f2_abs = ','.join([str(x) for x in f2_with_v_ab])
         f2_dps = ','.join([str(x) for x in f2_with_v_dp])
         f2_gqs = ','.join([str(x) for x in f2_with_v_gq])
-
 
     yield OrderedDict((
         ("chrom", v.CHROM),
@@ -349,6 +335,7 @@ def variant_info(v, kid, sample_dict, f2_with_v=[], f2_with_v_ab=[], f2_with_v_g
         ("qual_mean", "%.1f" % np.mean(quals)),
         ("call_rate", "%.3f" % v.call_rate),
         ("cohort_alt_depth", alt_sum),
+        ("cohort_total_depth", ref_sum + alt_sum),
         ("f2_with_variant", f2s),
         ("f2_with_variant_ab", f2_abs),
         ("f2_with_variant_gq", f2_gqs),
@@ -357,27 +344,19 @@ def variant_info(v, kid, sample_dict, f2_with_v=[], f2_with_v_ab=[], f2_with_v_g
 
 def denovo(v, sample_dict, p0, f1s, f2s,
         min_depth=10, 
-        max_mean_depth=400,
-        min_depth_percentile=3,
         min_qual=1,
         multigen=False,
-        _use_cohort_filters=True,
         exclude=None,
         simons_prefix=False,
-        eiee=False,
-        HET=1):
+        eiee=False):
     if not variant_prefilter(v, 1): return None
     return get_denovo(v, sample_dict, p0, f1s, f2s,
             min_depth=min_depth,
-            max_mean_depth=max_mean_depth,
             min_qual=min_qual,
             multigen=multigen,
             exclude=exclude,
-            _use_cohort_filters=_use_cohort_filters,
             simons_prefix=simons_prefix,
-            eiee=eiee,
-            HET=HET)
-
+            eiee=eiee)
 
 def write_denovo(d, fh, _line={}):
     if _line.get(fh.name, 0) == 0:
@@ -407,21 +386,19 @@ def run(args):
     p0 = [k for k in ped.samples() if k.mom is None and k.dad is None]
     f1s = [k for k in kids if k.mom.mom is None and k.dad.dad is None and k.mom.dad is None and k.dad.mom is None]
     f2s = [k for k in kids if k not in f1s]
-    _use_cohort_filters = False if os.environ.get("DN_NO_COHORT") else True
 
     simons_prefix = False
     if args.simons_prefix:
         simons_prefix = True
     n_dn = 0
+    
     for i, v in enumerate(vcf(str(args.chrom)) if args.chrom else vcf, start=1):
         if i % 10000 == 0:
             print(" called %d de-novos out of %d variants" % (n_dn, i), file=sys.stderr)
-
         d = denovo(v, sample_dict, p0, f1s, f2s, min_depth=args.min_depth,
                 min_qual=args.min_qual,
                 multigen=args.multigen, eiee=args.eiee,
-                exclude=exclude, _use_cohort_filters=_use_cohort_filters,
-                simons_prefix=simons_prefix)
+                exclude=exclude, simons_prefix=simons_prefix)
         if d is not None:
             write_denovo(d, sys.stdout)
             n_dn += 1
