@@ -25,11 +25,11 @@ def tranche99(filt, cutoff=99.6):
         return False
 
 def variant_prefilter(v, min_variant_qual):
-    if "*" in v.ALT: return False
+    #if "*" in v.ALT: return False
     if len(v.REF) > 10: return False
     # require FILTER to meet minimum tranche requirement
     #if v.FILTER is not None and not tranche99(v.FILTER): return False
-    if v.QUAL < min_variant_qual: return False
+    #if v.QUAL < min_variant_qual: return False
     return True
 
 def validate_in_f2(v, sample_dict, f1, children, f1_dnm_allele=1):
@@ -56,7 +56,8 @@ def validate_in_f2(v, sample_dict, f1, children, f1_dnm_allele=1):
     f2_with_v = []
     
     for f2 in children:
-        if f1.sample_id not in [f2.mom.sample_id, f2.dad.sample_id]: continue
+        if f2.mom.sample_id not in sample_dict or f2.dad.sample_id not in sample_dict: continue
+        if f1.sample_id not in (f2.mom.sample_id, f2.dad.sample_id): continue
         f2_idx = sample_dict[f2.sample_id]
         mi, di = sample_dict[f2.mom.sample_id], sample_dict[f2.dad.sample_id]
         # redefine genotypes as tuples    
@@ -87,6 +88,7 @@ def get_denovo(v, sample_dict, p0, f1s, f2s,
         min_depth=5,
         min_qual=1,
         multigen=False,
+        simple_trio=False,
         exclude=None,
         simons_prefix=False,
         eiee=False):
@@ -100,26 +102,25 @@ def get_denovo(v, sample_dict, p0, f1s, f2s,
     exclude: interval tree of regions to exclude.
     """
 
+
     if v.CHROM == 'Y': return None
     if exclude is not None:
         if len(exclude[v.CHROM].search(v.start, v.end)) > 0:
             return None
 
     ret = []
-   
     all_samples = p0 + f1s + f2s
     all_children = f1s + f2s
     # define the "kids" (i.e., probands) in which we search for DNMs
-    if multigen: kids = f1s
+    if multigen or simple_trio: kids = f1s
     else: kids = f2s
-    if eiee or simons_prefix: kids = f1s
     if simons_prefix:
         all_children = [x for x in all_children if 'SSC' in x.sample_id]
-
     depths = None
     ref_depths = None
     # loop over alternate alleles
     for alt_index, k in enumerate(v.ALT):
+        if k == '*': continue
         alt_depths = None
         # and then loop over the kids. 
         for kid in kids:
@@ -127,6 +128,7 @@ def get_denovo(v, sample_dict, p0, f1s, f2s,
             # sample '8477' was not included in CEPH sequencing
             if kid.mom.sample_id == '8477' or kid.dad.sample_id == '8477': continue
             ki = sample_dict[kid.sample_id]
+            if kid.mom.sample_id not in sample_dict or kid.dad.sample_id not in sample_dict: continue
             mi, di = sample_dict[kid.mom.sample_id], sample_dict[kid.dad.sample_id]
 
             # define genotypes
@@ -145,30 +147,45 @@ def get_denovo(v, sample_dict, p0, f1s, f2s,
             # which we'll compare to the kid's genotype
             parent_gts = list(m_gt)
             parent_gts.extend(list(d_gt))
+
             
             # if the kid has a genotype that's not observed in either parent, it's de novo
             # this could happen in a number of ways...
             # mom = (0, 0), dad = (0, 0), kid = (0, 1)
-            # mom = (1, 1), dad = (1, 3), kid = (1, 2) and so on
+            # mom = (1, 1), dad = (1, 3), kid = (1, 2) 
+            # mom = (1, 1), dad = (1, 3), kid = (4, 5) and so on
             uniq_gt_in_kid = any([x not in parent_gts for x in list(k_gt)])
             if not uniq_gt_in_kid: continue
-            dnm_allele = [a for a in list(k_gt) if a not in parent_gts][0]
-            # if the DNM allele isn't the ALT allele we're currently looping over, move on
-            if alt_index + 1 != dnm_allele: continue
+            dnm_alleles = [a for a in list(k_gt) if a not in parent_gts]
 
+            # if the kid has two alleles that are both de novo compared
+            # to the parents, this is so unlikely that we will ignore it
+            if len(set(dnm_alleles)) > 1: continue
+            
+
+            # if the kid has no alleles that are de novo compared to the
+            # parents, then obviously move on
+            if len(dnm_alleles) == 0: continue
+            
+            dnm_allele = dnm_alleles[0]
+
+            # check that kid is a HET (or HOM_ALT on hemizygous chroms in males)
             kid_is_hom = len(set(k_gt)) == 1
             kid_is_het = len(set(k_gt)) == 2 
 
-            # check that kid is a HET (or HOM_ALT on hemizygous chroms in males)
             if kid.sex == 'male' and v.CHROM == 'X':
                 if not kid_is_hom: continue
             else:
                 if not kid_is_het: continue
+            
+            
+            # if the DNM allele isn't the ALT allele we're currently looping over, move on
+            if alt_index + 1 != dnm_allele: continue
 
             quals = v.gt_quals
             quals[quals < 0] == 0
             if any([quals[i] < min_qual for i in (ki, mi, di)]): continue
-          
+
             # if we haven't already defined `depths`, do it now
             if depths is None:
                 ref_depths = v.gt_ref_depths
@@ -189,6 +206,21 @@ def get_denovo(v, sample_dict, p0, f1s, f2s,
             if (m_ref + m_alt) < (min_depth / norm_depth_by): continue
             if (d_ref + d_alt) < (min_depth / norm_depth_by): continue 
             if (k_alt + k_ref) < (min_depth / norm_depth_by): continue
+
+            # if we're in the F2 generation, check grandparents for
+            # evidence of the DNM allele
+            grandparental_evidence = 0
+            if not multigen and not simple_trio:
+                m_gm, m_gp = kid.mom.mom, kid.mom.dad
+                p_gm, p_gp = kid.dad.mom, kid.dad.dad
+                for gp in (m_gm, m_gp, p_gm, p_gp):
+                    if gp is None or gp.sample_id == '8477': continue
+                    gp_idx = sample_dict[gp.sample_id]
+                    gp_gt = (gts[gp_idx][0], gts[gp_idx][1])
+                    dnm_allele_count = list(gp_gt).count(dnm_allele)
+                    grandparental_evidence += dnm_allele_count
+                    #if dnm_allele_count > 0: grandparental_evidence += 1
+            #if grandparental_evidence > 0: continue
             
             # loop over all samples outside of the family we're considering
             # and count carriers of the DNM allele
@@ -196,6 +228,7 @@ def get_denovo(v, sample_dict, p0, f1s, f2s,
             likely_carriers = 0 # must meet QUAL and AB threshold
             
             for sample in all_samples:
+                # ignore carriers within the family of interest
                 if sample.family_id == kid.family_id: continue
                 sample_idx = sample_dict[sample.sample_id]
                 genotype = (gts[sample_idx][0], gts[sample_idx][1])
@@ -212,7 +245,7 @@ def get_denovo(v, sample_dict, p0, f1s, f2s,
                 if sample_qual < 20: continue
                 if sample_total < 10: continue
                 if v.CHROM == 'X':
-                    if sample.sex == 'male' and sample_alt / sample_total < 0.75: continue
+                    if sample.sex == 'male' and (sample_alt / sample_total) < 0.75: continue
                 else:
                     if not 0.25 <= (sample_alt / sample_total) <= 0.75: continue
                 likely_carriers += 1
@@ -249,12 +282,14 @@ def get_denovo(v, sample_dict, p0, f1s, f2s,
                                                          f2_with_v_dp=f2_with_v_dp,
                                                          alt_i=alt_index,
                                                          possible_carriers=possible_carriers,
-                                                         likely_carriers=likely_carriers))
+                                                         likely_carriers=likely_carriers,
+                                                         grandparental_evidence=grandparental_evidence))
     if len(ret) > 0: 
         return ret
 
 def variant_info(v, kid, sample_dict, f2_with_v=[], f2_with_v_ab=[], f2_with_v_gq=[], f2_with_v_dp=[],
-                    interval_type=None, alt_i=None, possible_carriers=0, likely_carriers=0):
+                    interval_type=None, alt_i=None, possible_carriers=0, likely_carriers=0, 
+                    grandparental_evidence=0):
 
     ki = sample_dict[kid.sample_id]
     mi, di = sample_dict[kid.mom.sample_id], sample_dict[kid.dad.sample_id]
@@ -336,6 +371,7 @@ def variant_info(v, kid, sample_dict, f2_with_v=[], f2_with_v_ab=[], f2_with_v_g
         ("call_rate", "%.3f" % v.call_rate),
         ("cohort_alt_depth", alt_sum),
         ("cohort_total_depth", ref_sum + alt_sum),
+        ("grandparental_evidence", grandparental_evidence),
         ("f2_with_variant", f2s),
         ("f2_with_variant_ab", f2_abs),
         ("f2_with_variant_gq", f2_gqs),
@@ -348,6 +384,7 @@ def denovo(v, sample_dict, p0, f1s, f2s,
         multigen=False,
         exclude=None,
         simons_prefix=False,
+        simple_trio=False,
         eiee=False):
     if not variant_prefilter(v, 1): return None
     return get_denovo(v, sample_dict, p0, f1s, f2s,
@@ -355,6 +392,7 @@ def denovo(v, sample_dict, p0, f1s, f2s,
             min_qual=min_qual,
             multigen=multigen,
             exclude=exclude,
+            simple_trio=simple_trio,
             simons_prefix=simons_prefix,
             eiee=eiee)
 
@@ -397,7 +435,7 @@ def run(args):
             print(" called %d de-novos out of %d variants" % (n_dn, i), file=sys.stderr)
         d = denovo(v, sample_dict, p0, f1s, f2s, min_depth=args.min_depth,
                 min_qual=args.min_qual,
-                multigen=args.multigen, eiee=args.eiee,
+                multigen=args.multigen, eiee=args.eiee, simple_trio=args.simple_trio,
                 exclude=exclude, simons_prefix=simons_prefix)
         if d is not None:
             write_denovo(d, sys.stdout)
@@ -417,6 +455,7 @@ def main(argv):
     p.add_argument("-simons_prefix", help="require all sample names to begin with the 'SSC' prefix", action="store_true")
     p.add_argument("-eiee", help="placeholder for eiee calling", action="store_true")
     p.add_argument("-multigen", help="use a third generation of samples to validate DNMs", action="store_true")
+    p.add_argument("-simple_trio", help="data are in two-generation pedigrees", action="store_true")
     p.add_argument("ped")
     p.add_argument("vcf")
 
