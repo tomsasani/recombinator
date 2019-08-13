@@ -20,6 +20,7 @@ def variant_prefilter(v, min_variant_qual):
     if len(v.REF) > 10: return False
     # require FILTER to meet minimum tranche requirement
     if v.FILTER is not None and 'VQSR' in v.FILTER: return False
+    #if int(v.INFO.get('AC')) > 50: return False
     return True
 
 def validate_in_f2(v, sample_dict, f1, children, f1_dnm_allele=1):
@@ -62,6 +63,8 @@ def validate_in_f2(v, sample_dict, f1, children, f1_dnm_allele=1):
         elif f1_is_dad and f1_dnm_allele in m_gt: continue
         else: pass
         # if we're on an autosome, the F2 should be HET for the DNM
+        # UPDATE: should probably just make sure that the DNM allele
+        # is not present at all?
         if v.CHROM != 'X':
             if list(f2_gt).count(f1_dnm_allele) != 1: continue
         # if we're on the X, female F2s should be HET and male F2s should be HOM_ALT.
@@ -95,6 +98,7 @@ def get_denovo(v, sample_dict, p0, f1s, f2s,
     exclude: interval tree of regions to exclude.
     """
 
+
     if v.CHROM == 'Y': return None
     if exclude is not None:
         if len(exclude[v.CHROM].search(v.start, v.end)) > 0:
@@ -118,6 +122,7 @@ def get_denovo(v, sample_dict, p0, f1s, f2s,
         alt_depths = None
         # and then loop over the kids. 
         for kid in kids:
+            if kid.sample_id not in sample_dict: continue
             if simons_prefix and 'SSC' not in kid.sample_id: continue
             # sample '8477' was not included in CEPH sequencing
             if kid.dad.sample_id == '8477': continue
@@ -197,9 +202,9 @@ def get_denovo(v, sample_dict, p0, f1s, f2s,
                 kid_ref_idx, kid_alt_idx = 0, k_gt[0]
             else:
                 kid_ref_idx, kid_alt_idx = k_gt
-
             if v.format('AD') is None: continue
-            
+           
+            # generate full 603-element arrays of depths
             ref_depths = v.format('AD')[:,kid_ref_idx]
             alt_depths = v.format('AD')[:,kid_alt_idx]
             total_depths = v.format('DP')
@@ -238,6 +243,7 @@ def get_denovo(v, sample_dict, p0, f1s, f2s,
                 for gp in (m_gm, m_gp, p_gm, p_gp):
                     if gp is None or gp.sample_id == '8477': continue
                     gp_idx = sample_dict[gp.sample_id]
+                    if total_depths[gp_idx] < 12 or quals[gp_idx] < 20: continue
                     gp_gt = (gts[gp_idx][0], gts[gp_idx][1])
                     dnm_allele_count = list(gp_gt).count(dnm_allele)
                     grandparental_evidence += dnm_allele_count
@@ -284,10 +290,8 @@ def get_denovo(v, sample_dict, p0, f1s, f2s,
             likely_carriers = 0 # must meet QUAL and AB threshold
             for sample in all_samples:
                 # ignore carriers within the family of interest
-                if multigen:
-                    if sample.family_id == kid.family_id: continue
-                else:
-                    if sample in cur_fam: continue
+                if sample in cur_fam: continue
+                if sample.sample_id not in sample_dict: continue
                 sample_idx = sample_dict[sample.sample_id]
                 genotype = (gts[sample_idx][0], gts[sample_idx][1])
                 dnm_allele_count = list(genotype).count(dnm_allele)
@@ -307,12 +311,10 @@ def get_denovo(v, sample_dict, p0, f1s, f2s,
                 if v.CHROM == 'X' and sample.sex == 'male':
                     if (sample_alt / sample_total) < 0.8: continue
                 else:
-                    if not 0.25 <= (sample_alt / sample_total) <= 0.75: continue
+                    if not 0.2 <= (sample_alt / sample_total) <= 0.8: continue
                 likely_carriers += 1
             possible_carriers -= likely_carriers
-             
-
-
+            
             ret.extend(variant_info(v, kid, sample_dict, f2_with_v=f2_with_v, 
                                                          f2_with_v_ab=f2_with_v_ab,
                                                          f2_with_v_gq=f2_with_v_gq,
@@ -365,9 +367,10 @@ def variant_info(v, kid, sample_dict, f2_with_v=[], f2_with_v_ab=[], f2_with_v_g
         ("an", v.INFO.get('AN')),
         ("possible_carriers", possible_carriers),
         ("likely_carriers", likely_carriers),
-        ("num_hom_alt", v.num_hom_alt),
         ("mq_vcf", v.INFO.get("MQ")),
         ("mapq_ranksum_vcf", v.INFO.get('MQRankSum')),
+        ("read_pos_ranksum", v.INFO.get("ReadPosRankSum")),
+        ("fisher_strand", v.INFO.get("FS")),
         ("qual_by_depth", v.INFO.get("QD")),
         ("filter", v.FILTER), #or "PASS"),
         ("paternal_id", kid.paternal_id),
@@ -434,7 +437,7 @@ def run(args):
     vcf = VCF(args.vcf, gts012=True, samples=samples)
     wtr = Writer("-", vcf)
 
-    sample_dict = {v: i for i, v in enumerate(vcf.samples)}
+    sample_dict = dict(zip(vcf.samples, range(len(vcf.samples))))
     kids = [k for k in ped.samples() if k.mom is not None and k.dad is not None]
 
     p0 = [k for k in ped.samples() if k.mom is None and k.dad is None]
